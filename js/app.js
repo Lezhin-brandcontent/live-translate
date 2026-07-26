@@ -38,7 +38,7 @@ function onSyncSessionsChanged() {
 }
 
 function onSyncState({ pending, error, signedIn = true }) {
-  if (!currentId) return;
+  if (!currentId || uploading) return;    // 업로드 중에는 UPLOADING 안내를 덮지 않는다
   if (!signedIn) $('saved-at').textContent = pending ? `LOCAL SAVED · ${pending} PENDING — SIGN IN TO SYNC` : '';
   else if (error) $('saved-at').textContent = `LOCAL SAVED · SYNC ERROR (${pending} PENDING)`;
   else if (pending) $('saved-at').textContent = `LOCAL SAVED · ${pending} SYNC PENDING`;
@@ -153,11 +153,12 @@ function route() {
   const outgoing = currentId && store.getSession(currentId);
   if (outgoing && (outgoing.status === 'listening' || outgoing.status === 'paused')) {
     engine.stop();                         // paused도 스트림을 보존하므로 화면 이탈 시 반드시 해제
-    stopRecording();
+    const leaving = stopRecording();
     void keepAwake(false);
     stopTick();
     store.updateSession(currentId, { status: 'ready', elapsedMs: acc });
     queueChanged();
+    void guardUpload(leaving);             // 화면을 떠나도 남은 파트 업로드는 지킨다
   }
   currentId = null;
   if (GATED && !currentUser && !gateBypass) { // 로그인 게이트 — 해시는 보존되어 로그인 후 원래 화면으로 이동
@@ -280,16 +281,40 @@ function startRecording(stream) {
   const sessionId = currentId, seq = recParts + 1, startMs = elapsedNow();
   const rec = createRecorder(stream, (blob, mime) => {
     const part = { sessionId, seq, startMs, durMs: Math.max(0, elapsedNow() - startMs), blob, mime, ext: recExt(mime) };
-    void uploadPart(part);
+    return uploadPart(part);            // Promise 반환 — rec.stopped가 업로드 완료까지 늘어난다
   });
   if (rec) { activeRec = rec; recParts = seq; }
 }
 
+// 업로드 완료 Promise를 반환한다 — 호출자는 guardUpload로 감싸 이탈을 막는다.
 function stopRecording() {
-  if (activeRec && activeRec.state !== 'inactive') activeRec.stop();
+  const rec = activeRec;
+  if (rec && rec.state !== 'inactive') rec.stop();
   activeRec = null;
   recStream?.getTracks().forEach(t => t.stop());  // REC 모드 원시 캡처도 함께 정리 (LIVE는 null — no-op)
   recStream = null;
+  return rec?.stopped ?? Promise.resolve();
+}
+
+let uploading = 0;                        // 진행 중 업로드 수
+const warnUnload = e => { e.preventDefault(); e.returnValue = ''; };
+
+// 녹음 blob은 메모리에만 있어 페이지가 죽으면 영구 소실된다 (48분 세션 = 16MB, 업로드에 수십 초).
+// 끝날 때까지 이탈 경고 + 화면 유지 — 모바일은 beforeunload가 안 먹으므로 wakeLock이 실질 방어다.
+async function guardUpload(promise) {
+  if (uploading++ === 0) {
+    window.addEventListener('beforeunload', warnUnload);
+    void keepAwake(true);
+  }
+  if (currentId) $('saved-at').textContent = 'UPLOADING RECORDING — KEEP THIS SCREEN OPEN';
+  try { await promise; }
+  finally {
+    if (--uploading === 0) {
+      window.removeEventListener('beforeunload', warnUnload);
+      if (store.getSession(currentId)?.status !== 'listening') void keepAwake(false);
+      if ($('saved-at').textContent.startsWith('UPLOADING')) $('saved-at').textContent = '';
+    }
+  }
 }
 
 async function uploadPart(part) {
@@ -787,6 +812,7 @@ async function doAction(action) {
   if (!s) return;
   const next = transition(s.status, action);
   if (!next) return;
+  let endUpload = null;
   busy = true;
   try {
     if (action === 'start') {
@@ -829,11 +855,11 @@ async function doAction(action) {
     else if (action === 'end') {
       if (s.mode === 'rec') transcribePendingFor = actionId; // 업로드 완료 후 자동 전사 — 전사 안 된 파트만 증분 처리
       if (s.mode !== 'rec') engine.stop();
-      stopRecording();
+      endUpload = stopRecording();       // 상태 저장은 막지 않고, 아래에서 가드만 건다
       stopTick();
     }
   } catch (e) {
-    stopRecording();
+    void guardUpload(stopRecording());
     if (e.message !== 'NO_KEY' && currentId === actionId)
       $('status-line').textContent = 'ERROR: ' + e.message.toUpperCase().slice(0, 60);
     return; // 상태 전이 취소
@@ -844,6 +870,7 @@ async function doAction(action) {
   renderStatus(next);
   void keepAwake(next === 'listening');
   queueChanged();
+  if (endUpload) void guardUpload(endUpload); // keepAwake 뒤 — 업로드 동안 화면을 다시 붙잡는다
 }
 
 function startTick() { since = Date.now(); tick = setInterval(() => { const t = fmtTimer(elapsedNow()); $('timer').textContent = t; $('f-state').textContent = `${focusPrefix} — ${t}`; }, 500); }

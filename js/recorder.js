@@ -17,7 +17,11 @@ export function createRecorder(stream, onBlob) {
     { mimeType: mime, audioBitsPerSecond: 48000 });
   const chunks = [];
   rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-  rec.onstop = () => onBlob(new Blob(chunks, { type: mime }), mime);
+  // stopped: onBlob이 돌려준 업로드 Promise로 resolve — stop()은 즉시 반환하고 blob은
+  // 비동기 onstop에서야 생기므로, 호출자가 업로드 완료를 기다리려면 이 핸들이 필요하다.
+  let settle;
+  rec.stopped = new Promise(resolve => { settle = resolve; });
+  rec.onstop = () => settle(onBlob(new Blob(chunks, { type: mime }), mime));
   rec.start(1000); // 1s 청크 — 크래시 시 브라우저가 이미 모은 청크는 보존
   return rec;
 }
